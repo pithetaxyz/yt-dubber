@@ -1,0 +1,12 @@
+yt-dlp
+openai-whisper
+transformers
+sentencepiece
+sacremoses
+edge-tts
+pydub
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+torch
+torchaudio
