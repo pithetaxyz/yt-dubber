@@ -10,3 +10,4 @@ google-auth-oauthlib
 google-auth-httplib2
 torch
 torchaudio
+flask
