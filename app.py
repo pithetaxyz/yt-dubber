@@ -56,7 +56,7 @@ class _Capture(io.TextIOBase):
 
 
 # ── Pipeline thread ──────────────────────────────────────────────────────────
-def _run(url, out_dir, whisper_size, voice, translator, do_upload):
+def _run(url, out_dir, whisper_size, voice, translator, do_upload, clean_tmp):
     with _lock:
         _state.update(status="running", log=[], result=None, error=None)
 
@@ -65,6 +65,13 @@ def _run(url, out_dir, whisper_size, voice, translator, do_upload):
     sys.stderr = _Capture(orig_err)
 
     try:
+        import shutil
+        if clean_tmp:
+            tmp_dir = Path(out_dir) / "_tmp"
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+                print(f"  [CLEAN] Removed {tmp_dir}")
+
         import dubber
         out_path, title_en, source_url, transcript_path = dubber.run(
             url=url,
@@ -136,6 +143,7 @@ def run_job():
             data.get("voice") or "",
             data.get("translator") or "helsinki",
             bool(data.get("upload", True)),
+            bool(data.get("clean_tmp", True)),
         ),
         daemon=True,
     ).start()
@@ -262,9 +270,15 @@ _HTML = """<!DOCTYPE html>
       <label for="outdir">Output folder</label>
       <input type="text" id="outdir" value="output">
     </div>
-    <div class="toggle-row" style="padding-top:1.4rem">
-      <input type="checkbox" id="upload" checked>
-      <span>Upload to YouTube after dubbing</span>
+    <div style="display:flex;flex-direction:column;gap:0.5rem;padding-top:1.4rem">
+      <div class="toggle-row">
+        <input type="checkbox" id="upload" checked>
+        <span>Upload to YouTube after dubbing</span>
+      </div>
+      <div class="toggle-row">
+        <input type="checkbox" id="clean_tmp" checked>
+        <span>Clean _tmp before processing</span>
+      </div>
     </div>
   </div>
 </div>
@@ -325,6 +339,7 @@ async function startJob() {
     voice:        document.getElementById('voice').value.trim(),
     out_dir:      document.getElementById('outdir').value.trim() || 'output',
     upload:       document.getElementById('upload').checked,
+    clean_tmp:    document.getElementById('clean_tmp').checked,
   };
 
   const res = await fetch('/run', {
