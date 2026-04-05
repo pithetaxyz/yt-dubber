@@ -51,6 +51,9 @@ class _Capture(io.TextIOBase):
     def flush(self):
         self._orig.flush()
 
+    def reconfigure(self, **kwargs):
+        pass  # no-op — dubber.py calls this at import time
+
 
 # ── Pipeline thread ──────────────────────────────────────────────────────────
 def _run(url, out_dir, whisper_size, voice, translator, do_upload):
