@@ -55,15 +55,33 @@ YouTube URL
 - ffmpeg
 - NVIDIA GPU with CUDA 12.x driver
 
-Install Python 3.12 and ffmpeg:
+### 1. Install Python 3.12
+
+`winget` often leaves the Microsoft Store stub as the active `python` command. Use the setup script to install and fix PATH automatically:
+
+```powershell
+winget install Python.Python.3.12 --accept-package-agreements
+.\setup_python.ps1   # locates the real executable and adds it to user PATH
 ```
-winget install Python.Python.3.12
+
+Open a new terminal and verify:
+```powershell
+python --version   # should print Python 3.12.x
+pip --version
+```
+
+> **Why not just winget?** After install, `python` often still points to the Windows Store stub. `setup_python.ps1` uses the `py` launcher (`py -3.12`) to locate the real executable and patches your user PATH correctly.
+
+### 2. Install ffmpeg
+
+```powershell
 winget install Gyan.FFmpeg
 ```
 
-Install Python dependencies:
-```
-install.bat
+### 3. Install Python dependencies
+
+```powershell
+.\install.bat
 ```
 
 ## Usage

@@ -175,28 +175,65 @@ def detect_gender(vocals_path: Path) -> str:
 
 
 VOICE_MAP = {
-    "female": "en-US-JennyNeural",
-    "male":   "en-US-ChristopherNeural",
+    "en": {
+        "female": "en-US-JennyNeural",
+        "male":   "en-US-ChristopherNeural",
+    },
+    "zh": {
+        "female": "zh-CN-XiaoxiaoNeural",
+        "male":   "zh-CN-YunxiNeural",
+    },
+}
+
+HELSINKI_MODEL = {
+    "zh-en": "Helsinki-NLP/opus-mt-zh-en",
+    "en-zh": "Helsinki-NLP/opus-mt-en-zh",
+}
+
+DUBBED_SUFFIX = {
+    "en": "_EN_dubbed",
+    "zh": "_ZH_dubbed",
 }
 
 
+# ── Language detection via Whisper ────────────────────────────────────────────
+def detect_language(vocals_wav: Path, whisper_model) -> str:
+    """
+    Use Whisper's built-in language detector on the first 30 s of vocal audio.
+    Returns a language code such as 'zh', 'en', 'ja', etc.
+    """
+    audio = whisper.load_audio(str(vocals_wav))
+    audio = whisper.pad_or_trim(audio)
+    mel = whisper.log_mel_spectrogram(audio, n_mels=whisper_model.dims.n_mels).to(DEVICE)
+    _, probs = whisper_model.detect_language(mel)
+    lang = max(probs, key=probs.get)
+    print(f"  Detected language: {lang} (confidence: {probs[lang]:.2%})")
+    return lang
+
+
 # ── Step 3: Transcribe with Whisper (GPU) ─────────────────────────────────────
-def transcribe(wav_path: Path, whisper_model) -> list[dict]:
+def transcribe(wav_path: Path, whisper_model, language: str = "zh") -> list[dict]:
     """
     Transcribe Chinese audio with word-level timestamps, then split into
     sentence-level segments at punctuation boundaries so each TTS clip
     covers exactly one sentence.
     """
+    # Encourage sentence-ending punctuation for the source language
+    _initial_prompts = {
+        "zh": "请使用标点符号。例如：你好！今天天气很好。我们去吃饭吧？",
+        "en": "Please use proper punctuation. For example: Hello! How are you? Let's go.",
+    }
+    initial_prompt = _initial_prompts.get(language, "")
+
     print(f"  Running on: {DEVICE.upper()}")
     result = whisper_model.transcribe(
         str(wav_path),
-        language="zh",
+        language=language,
         task="transcribe",
         word_timestamps=True,
         fp16=(DEVICE == "cuda"),
         verbose=False,
-        # Encourage Whisper to emit Chinese punctuation
-        initial_prompt="请使用标点符号。例如：你好！今天天气很好。我们去吃饭吧？",
+        initial_prompt=initial_prompt,
     )
 
     SENTENCE_END = set("。！？…!?")
@@ -294,8 +331,8 @@ def translate_helsinki(texts: list[str], tokenizer, model) -> list[str]:
 
 
 # ── Step 4b: Translate with TranslateGemma-4B (4-bit, GPU) ───────────────────
-def translate_gemma(texts: list[str]) -> list[str]:
-    """Translate a list of Chinese strings using TranslateGemma-4B (4-bit quantized)."""
+def translate_gemma(texts: list[str], src_lang: str = "Chinese", tgt_lang: str = "English") -> list[str]:
+    """Translate a list of strings using TranslateGemma-4B (4-bit quantized)."""
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
     # NOTE: Even the E2B 4-bit quantized model requires ~4GB VRAM.
@@ -315,7 +352,7 @@ def translate_gemma(texts: list[str]) -> list[str]:
     translated = []
     total = len(texts)
     for i, text in enumerate(texts):
-        messages = [{"role": "user", "content": f"Translate the following text from Chinese to English:\n{text}"}]
+        messages = [{"role": "user", "content": f"Translate the following text from {src_lang} to {tgt_lang}:\n{text}"}]
         input_ids = tokenizer.apply_chat_template(
             messages, return_tensors="pt", add_generation_prompt=True
         ).to(DEVICE)
@@ -339,6 +376,7 @@ def translate_gemma(texts: list[str]) -> list[str]:
 
 
 # ── Step 5: Generate TTS with edge-tts ───────────────────────────────────────
+# TODO: look into VibeVoice as a higher-quality TTS backend
 async def _tts_one(text: str, path: Path, voice: str) -> bool:
     """Attempt a single TTS generation. Returns True on success."""
     try:
@@ -502,8 +540,25 @@ def merge(video_path: Path, dubbed_audio_path: Path, output_path: Path):
     )
 
 
+# ── Archive helper ────────────────────────────────────────────────────────────
+def archive_output(out_dir: Path, video_id: str) -> Path:
+    """
+    Move *out_dir* to  <out_dir.parent>/archive/<video_id>/
+    then recreate an empty *out_dir*.  Returns the archive destination path.
+    """
+    import shutil
+
+    dest = out_dir.parent / "archive" / video_id
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(out_dir), str(dest))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  [ARCHIVE] Moved output -> {dest}")
+    print(f"  [ARCHIVE] Recreated empty {out_dir}")
+    return dest
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
-def run(url: str, out_dir: Path, whisper_size: str = "large", voice: str = None, translator: str = "helsinki"):
+def run(url: str, out_dir: Path, whisper_size: str = "large", voice: str = None, translator: str = "helsinki", archive: bool = True):
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = out_dir / "_tmp"
     tmp_dir.mkdir(exist_ok=True)
@@ -536,84 +591,99 @@ def run(url: str, out_dir: Path, whisper_size: str = "large", voice: str = None,
         vocals_path, background_path = separate_audio(wav_path, tmp_dir)
     print(f"  Background: {background_path}")
 
-    # Auto-detect gender from vocals if voice not manually specified
-    if voice is None:
-        gender = detect_gender(vocals_path)
-        voice = VOICE_MAP[gender]
-        print(f"  Auto-selected voice: {voice}")
-
-    # ── 4. Transcribe
+    # ── 4. Transcribe (with auto language detection)
     raw_transcript_path = tmp_dir / f"{video_id}_raw.json"
     banner(f"Step 4/8 - Transcribing (Whisper {whisper_size})")
+
+    # Use isolated vocals for transcription — cleaner than mixed audio
+    vocals_wav = tmp_dir / "vocals_whisper.wav"
+    if not vocals_wav.exists():
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(vocals_path),
+             "-ar", "16000", "-ac", "1", str(vocals_wav)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    print("  Loading Whisper model (first run downloads ~3 GB)...")
+    whisper_model = whisper.load_model(whisper_size, device=DEVICE)
+
+    # Detect language from vocals, then decide translation direction
+    src_lang = detect_language(vocals_wav, whisper_model)
+    # Collapse regional variants (e.g. 'yue' Cantonese → treat as 'zh')
+    if src_lang in ("yue", "zh-TW", "wuu"):
+        src_lang = "zh"
+    tgt_lang = "en" if src_lang == "zh" else "zh"
+    print(f"  Direction: {src_lang} → {tgt_lang}")
+
     if done(raw_transcript_path):
         print("  [SKIP] Transcription already done — loading from file")
         with open(raw_transcript_path, encoding="utf-8") as f:
             segments = json.load(f)
+        del whisper_model
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
     else:
-        # Use isolated vocals for transcription — cleaner than mixed audio
-        vocals_wav = tmp_dir / "vocals_whisper.wav"
-        if not vocals_wav.exists():
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(vocals_path),
-                 "-ar", "16000", "-ac", "1", str(vocals_wav)],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        print("  Loading Whisper model (first run downloads ~3 GB)...")
-        whisper_model = whisper.load_model(whisper_size, device=DEVICE)
-        segments = transcribe(vocals_wav, whisper_model)
+        segments = transcribe(vocals_wav, whisper_model, language=src_lang)
         del whisper_model
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
         with open(raw_transcript_path, "w", encoding="utf-8") as f:
             json.dump(segments, f, ensure_ascii=False, indent=2)
 
+    # Auto-detect gender from vocals if voice not manually specified
+    if voice is None:
+        gender = detect_gender(vocals_path)
+        voice = VOICE_MAP[tgt_lang][gender]
+        print(f"  Auto-selected voice: {voice}")
+
     # ── 5. Translate
     transcript_path = out_dir / f"{video_id}_transcript.json"
-    banner("Step 5/8 - Translating Chinese -> English")
+    _lang_names = {"zh": "Chinese", "en": "English"}
+    src_name, tgt_name = _lang_names.get(src_lang, src_lang), _lang_names.get(tgt_lang, tgt_lang)
+    banner(f"Step 5/8 - Translating {src_name} -> {tgt_name}")
     if done(transcript_path):
         print("  [SKIP] Translation already done — loading from file")
         with open(transcript_path, encoding="utf-8") as f:
             saved = json.load(f)
-        # Support both old format (list) and new format (dict with title)
         if isinstance(saved, dict):
-            title_en = saved.get("title", title)
-            en_segments = saved["segments"]
+            title_translated = saved.get("title", title)
+            translated_segments = saved["segments"]
         else:
-            title_en = title
-            en_segments = saved
-        for seg, en in zip(segments, en_segments):
-            seg["translated"] = en["text"]
+            title_translated = title
+            translated_segments = saved
+        for seg, ts in zip(segments, translated_segments):
+            seg["translated"] = ts["text"]
     else:
         seg_texts = [s["text"] for s in segments]
+        direction_key = f"{src_lang}-{tgt_lang}"
 
         if translator == "gemma":
             print(f"  Using TranslateGemma-4B")
-            title_en = translate_title(title, translate_gemma)
-            seg_translations = translate_gemma(seg_texts)
+            title_translated = translate_title(title, lambda t: translate_gemma(t, src_name, tgt_name))
+            seg_translations = translate_gemma(seg_texts, src_name, tgt_name)
         else:
-            model_name = "Helsinki-NLP/opus-mt-zh-en"
+            model_name = HELSINKI_MODEL.get(direction_key, HELSINKI_MODEL["zh-en"])
             print(f"  Using {model_name} (first run downloads ~300 MB)...")
             tokenizer = MarianTokenizer.from_pretrained(model_name)
             mt_model = MarianMTModel.from_pretrained(model_name).to(DEVICE)
-            # Translate title in pieces if long — batching or long inputs degrade quality
-            title_en = translate_title(title, lambda texts: translate_helsinki(texts, tokenizer, mt_model))
+            title_translated = translate_title(title, lambda texts: translate_helsinki(texts, tokenizer, mt_model))
             seg_translations = translate_helsinki(seg_texts, tokenizer, mt_model)
             del mt_model
             if DEVICE == "cuda":
                 torch.cuda.empty_cache()
 
-        print(f"  Title (EN): {title_en}")
+        print(f"  Title ({tgt_lang.upper()}): {title_translated}")
 
-        for seg, eng in zip(segments, seg_translations):
-            seg["translated"] = eng
+        for seg, t in zip(segments, seg_translations):
+            seg["translated"] = t
 
-        en_segments = [{"start": s["start"], "end": s["end"], "text": s["translated"]} for s in segments]
+        translated_segments = [{"start": s["start"], "end": s["end"], "text": s["translated"]} for s in segments]
         with open(transcript_path, "w", encoding="utf-8") as f:
-            json.dump({"title": title_en, "segments": en_segments}, f, ensure_ascii=False, indent=2)
+            json.dump({"title": title_translated, "segments": translated_segments}, f, ensure_ascii=False, indent=2)
         print(f"  Saved: {transcript_path}")
 
     # ── 6. TTS  (generate_tts already skips existing files internally)
-    banner(f"Step 6/8 - Generating English speech [{voice}]")
+    banner(f"Step 6/8 - Generating {tgt_name} speech [{voice}]")
     tts_dir = tmp_dir / "tts"
     segments = asyncio.run(generate_tts(segments, tts_dir, voice))
 
@@ -623,21 +693,28 @@ def run(url: str, out_dir: Path, whisper_size: str = "large", voice: str = None,
     if done(dubbed_audio_path):
         print("  [SKIP] Dubbed audio already assembled")
     else:
-        total_dur = en_segments[-1]["end"] if en_segments else duration
+        total_dur = translated_segments[-1]["end"] if translated_segments else duration
         dubbed_audio = assemble_audio(segments, total_dur, background_path=background_path)
         dubbed_audio.export(str(dubbed_audio_path), format="mp3", bitrate="192k")
 
     # ── 8. Merge
-    output_path = out_dir / f"{video_id}_EN_dubbed.mp4"
+    output_path = out_dir / f"{video_id}{DUBBED_SUFFIX[tgt_lang]}.mp4"
     banner("Step 8/8 - Merging audio into video")
     if done(output_path):
         print("  [SKIP] Final video already merged")
     else:
         merge(video_path, dubbed_audio_path, output_path)
 
+    # ── Archive: move out_dir to archive/<original_title>/ then recreate empty out_dir
+    if archive:
+        banner("Archiving output directory")
+        archive_dest = archive_output(out_dir, video_id)
+        output_path    = archive_dest / output_path.name
+        transcript_path = archive_dest / transcript_path.name
+
     banner("Done!")
     print(f"  Output: {output_path}\n")
-    return output_path, title_en, url, transcript_path
+    return output_path, title_translated, url, transcript_path, duration
 
 
 # ── Step cache map (used by --redo-from) ─────────────────────────────────────
@@ -653,7 +730,7 @@ def clear_from_step(step: int, out_dir: Path, video_id: str):
         5: [out_dir / f"{video_id}_transcript.json"],
         6: [tmp_dir / "tts"],
         7: [tmp_dir / "dubbed_audio.mp3"],
-        8: [out_dir / f"{video_id}_EN_dubbed.mp4"],
+        8: [out_dir / f"{video_id}_EN_dubbed.mp4", out_dir / f"{video_id}_ZH_dubbed.mp4"],
     }
 
     cleared = []
@@ -687,7 +764,7 @@ def clear_step(step: int, out_dir: Path, video_id: str):
         5: [out_dir / f"{video_id}_transcript.json"],
         6: [tmp_dir / "tts"],
         7: [tmp_dir / "dubbed_audio.mp3"],
-        8: [out_dir / f"{video_id}_EN_dubbed.mp4"],
+        8: [out_dir / f"{video_id}_EN_dubbed.mp4", out_dir / f"{video_id}_ZH_dubbed.mp4"],
     }
 
     cleared = []
@@ -734,6 +811,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--upload", action="store_true", help="Upload to YouTube after dubbing")
     parser.add_argument(
+        "--no-skip-long",
+        action="store_true",
+        default=False,
+        help="Upload even if video is longer than 15 minutes (skip-long is on by default for new account limits)",
+    )
+    parser.add_argument(
+        "--no-archive",
+        action="store_true",
+        default=False,
+        help="Skip archiving output dir to archive/<title>/ after completion (archive is on by default)",
+    )
+    parser.add_argument(
         "--redo-from",
         type=int,
         choices=range(2, 9),
@@ -765,14 +854,18 @@ if __name__ == "__main__":
             banner(f"Clearing cache for step {args.redo_step} only")
             clear_step(args.redo_step, Path(args.out), video_id)
 
-    out_path, title, source_url, transcript_path = run(
+    out_path, title, source_url, transcript_path, duration = run(
         url=args.url,
         out_dir=Path(args.out),
         whisper_size=args.whisper,
         voice=args.voice,
         translator=args.translator,
+        archive=not args.no_archive,
     )
 
     if args.upload:
-        from uploader import upload_to_youtube
-        upload_to_youtube(str(out_path), f"{title} [English Dubbed]", source_url=source_url, source_title=title, transcript_path=str(transcript_path))
+        if duration > 15 * 60 and not args.no_skip_long:
+            print(f"\n  [SKIP UPLOAD] Video is {duration/60:.1f} min — over 15-min new-account limit. Use --no-skip-long to override.")
+        else:
+            from uploader import upload_to_youtube
+            upload_to_youtube(str(out_path), f"{title} [English Dubbed]", source_url=source_url, source_title=title, transcript_path=str(transcript_path))
